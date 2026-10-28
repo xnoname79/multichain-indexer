@@ -5,8 +5,6 @@ type WalletType string
 type KeyType string
 type AddressStandard string
 type NetworkType string
-type BFType string
-type KVStoreType string
 
 const (
 	WalletTypeStandard WalletType = "standard"
@@ -43,13 +41,3 @@ var AllNetworkTypes = []NetworkType{
 	NetworkTypeXRP,
 	NetworkTypeStellar,
 }
-
-const (
-	BFBackendRedis    BFType = "redis"
-	BFBackendInMemory BFType = "in_memory"
-)
-
-const (
-	KVStoreTypeBadger KVStoreType = "badger"
-	KVStoreTypeConsul KVStoreType = "consul"
-)

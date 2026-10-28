@@ -19,7 +19,7 @@ services:
       - ./configs:/app/configs:ro
       # Mount logs directory for persistent logging
       - ./logs:/app/logs
-      # Mount data directory for BadgerDB (if using local storage)
+      # Mount data directory for the SQLite state file (services.db_path)
       - ./data:/app/data
       # Mount certificates directory for TLS/mTLS connections
       - ./certs:/app/certs:ro

@@ -11,16 +11,16 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
-	"gorm.io/gorm"
 
 	"github.com/fystack/multichain-indexer/internal/status"
 	"github.com/fystack/multichain-indexer/internal/worker"
-	"github.com/fystack/multichain-indexer/pkg/addressbloomfilter"
 	"github.com/fystack/multichain-indexer/pkg/common/config"
 	"github.com/fystack/multichain-indexer/pkg/common/logger"
 	"github.com/fystack/multichain-indexer/pkg/events"
 	"github.com/fystack/multichain-indexer/pkg/infra"
 	"github.com/fystack/multichain-indexer/pkg/kvstore"
+	"github.com/fystack/multichain-indexer/pkg/store/missingblockstore"
+	"github.com/fystack/multichain-indexer/pkg/store/pubkeystore"
 )
 
 type CLI struct {
@@ -39,7 +39,7 @@ type IndexCmd struct {
 
 	// Worker modes (these can override config settings)
 	EnableCatchup bool `help:"Enable catchup worker to process historical blocks alongside regular indexing. Overrides config setting." name:"catchup"`
-	EnableManual  bool `help:"Enable manual worker for processing specific block ranges via Redis queue. Overrides config setting."     name:"manual"`
+	EnableManual  bool `help:"Enable manual worker for processing block ranges queued via POST /manual-ranges. Overrides config setting."     name:"manual"`
 
 	// Block starting point
 	FromLatest bool `help:"Start indexing from the latest blockchain block instead of configured starting points. Useful for fresh deployments." name:"from-latest"`
@@ -82,83 +82,20 @@ func runIndexer(chains []string, configPath string, debug, manual, catchup, from
 	logger.Info("Config loaded", "environment", cfg.Environment)
 
 	services := cfg.Services
-	// start redis
-	logger.Info(
-		"Connecting to redis",
-		"url",
-		services.Redis.URL,
-		"environment",
-		cfg.Environment,
-		"mtls",
-		services.Redis.MTLS,
-	)
-	redisClient, err := infra.NewRedisClient(
-		services.Redis.URL,
-		services.Redis.Password,
-		string(cfg.Environment),
-		services.Redis.MTLS,
-	)
+	dbPath := services.DBPath
+	if dbPath == "" {
+		dbPath = "data/indexer.db"
+	}
+	db, err := infra.OpenSQLite(dbPath)
 	if err != nil {
-		logger.Fatal("Create redis client failed", "err", err)
+		logger.Fatal("Open SQLite failed", "path", dbPath, "err", err)
 	}
-	logger.Info("Redis connection established")
+	defer db.Close()
+	logger.Info("SQLite opened", "path", dbPath)
 
-	// start db (optional)
-	var db *gorm.DB
-	if services.Database != nil {
-		db, err = infra.NewDBConnection(services.Database.URL, string(cfg.Environment))
-		if err != nil {
-			logger.Fatal("Create db connection failed", "err", err)
-		}
-		logger.Info("Database connection established")
-	} else {
-		logger.Info("Database connection skipped - not configured")
-	}
-
-	// start kvstore
-	logger.Info("Connecting to kvstore", "url", services.KVS.Consul.Address)
-	kvstore, err := kvstore.NewFromConfig(services.KVS)
-	if err != nil {
-		logger.Fatal("Create kvstore failed", "err", err)
-	}
-	defer kvstore.Close()
-
-	logger.Info("Connecting to NATS", "url", services.Nats.URL)
-	natsConn, err := infra.GetNATSConnection(services.Nats, string(cfg.Environment))
-	if err != nil {
-		logger.Fatal("Create NATS connection failed", "err", err)
-	}
-	defer natsConn.Close()
-	logger.Info("NATS connection established")
-
-	eventQueueManager := infra.NewNATsMessageQueueManager("transfer", []string{
-		"transfer.event.*",
-	}, natsConn)
-	eventQueue := eventQueueManager.NewMessageQueue("dispatch")
-
-	utxoQueueManager := infra.NewNATsMessageQueueManager("utxo", []string{
-		"utxo.event.*",
-	}, natsConn)
-	utxoQueue := utxoQueueManager.NewMessageQueue("dispatch")
-
-	emitter := events.NewEmitter(eventQueue, utxoQueue, services.Nats.SubjectPrefix)
+	kvstore := kvstore.NewSQLiteStore(db, infra.JSON)
+	emitter := events.NewEmitter(db, services.Webhook)
 	defer emitter.Close()
-
-	// start address bloom filter (Initialize is optional)
-	var addressBF addressbloomfilter.WalletAddressBloomFilter
-	if services.Bloomfilter != nil && db != nil {
-		addressBF = addressbloomfilter.NewBloomFilter(*services.Bloomfilter, db, redisClient)
-		if err := addressBF.Initialize(ctx); err != nil {
-			logger.Fatal("Address bloom filter init failed", "err", err)
-		}
-		logger.Info("Address bloom filter initialized")
-	} else if services.Bloomfilter != nil {
-		// Create bloom filter instance even without database, but skip initialization
-		addressBF = addressbloomfilter.NewBloomFilter(*services.Bloomfilter, db, redisClient)
-		logger.Info("Address bloom filter created (initialization skipped - no database)")
-	} else {
-		logger.Info("Address bloom filter skipped - not configured")
-	}
 
 	// If no chains specified, use all configured chains
 	if len(chains) == 0 {
@@ -179,19 +116,11 @@ func runIndexer(chains []string, configPath string, debug, manual, catchup, from
 		logger.Info("Starting from latest block for all specified chains", "chains", chains)
 	}
 
-	// Build bloom sync config if enabled
-	var bloomSyncCfg *worker.BloomSyncConfig
-	if services.Bloomfilter != nil && services.Bloomfilter.Sync.Enabled && db != nil {
-		c := worker.NewBloomSyncConfig(services.Bloomfilter.Sync)
-		bloomSyncCfg = &c
-	}
-
 	// Create manager with all workers using factory
 	managerCfg := worker.ManagerConfig{
 		Chains:        chains,
 		EnableCatchup: catchup,
 		EnableManual:  manual,
-		BloomSync:     bloomSyncCfg,
 	}
 
 	manager := worker.CreateManagerWithWorkers(
@@ -199,13 +128,17 @@ func runIndexer(chains []string, configPath string, debug, manual, catchup, from
 		cfg,
 		kvstore,
 		db,
-		addressBF,
 		emitter,
-		redisClient,
 		managerCfg,
 	)
 
-	healthServer := startHealthServer(cfg.Services.Port, cfg, manager)
+	api := &adminAPI{
+		token:   services.APIToken,
+		cfg:     cfg,
+		pubkeys: pubkeystore.NewPublicKeyStore(db),
+		ranges:  missingblockstore.NewMissingBlocksStore(db),
+	}
+	healthServer := startHealthServer(cfg.Services.Port, cfg, manager, api)
 
 	// Start all workers
 	logger.Info("Starting all workers")
@@ -239,8 +172,9 @@ type HealthResponse struct {
 	Version   string    `json:"version"`
 }
 
-func startHealthServer(port int, cfg *config.Config, manager *worker.Manager) *http.Server {
+func startHealthServer(port int, cfg *config.Config, manager *worker.Manager, api *adminAPI) *http.Server {
 	mux := http.NewServeMux()
+	api.register(mux)
 
 	version := cfg.Version
 	if version == "" {

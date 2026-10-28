@@ -1,15 +1,12 @@
 package pubkeystore
 
 import (
-	"fmt"
+	"database/sql"
+	"errors"
 
-	"github.com/fystack/multichain-indexer/pkg/addressbloomfilter"
 	"github.com/fystack/multichain-indexer/pkg/common/enum"
+	"github.com/fystack/multichain-indexer/pkg/common/logger"
 )
-
-func composeKey(addressType enum.NetworkType, publicKey string) string {
-	return fmt.Sprintf("%s/%s", addressType, publicKey)
-}
 
 type Store interface {
 	Exist(addressType enum.NetworkType, publicKey string) bool
@@ -18,37 +15,51 @@ type Store interface {
 	Close() error
 }
 
+// publicKeyStore looks addresses up in the SQLite wallet_addresses table.
+// Matches are exact and new rows are visible on the next lookup.
 type publicKeyStore struct {
-	bloomFilter addressbloomfilter.WalletAddressBloomFilter
+	db *sql.DB
 }
 
-func NewPublicKeyStore(
-	bloomFilter addressbloomfilter.WalletAddressBloomFilter,
-) Store {
-	return &publicKeyStore{bloomFilter: bloomFilter}
+func NewPublicKeyStore(db *sql.DB) Store {
+	return &publicKeyStore{db: db}
 }
 
 func (s *publicKeyStore) Exist(addressType enum.NetworkType, publicKey string) bool {
-	if s.bloomFilter == nil {
+	if publicKey == "" {
 		return false
 	}
-	return s.bloomFilter.Contains(publicKey, addressType)
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM wallet_addresses WHERE type = ? AND address = ?`,
+		string(addressType), publicKey,
+	).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false
+	}
+	if err != nil {
+		// shortcut: fails open (like a bloom filter false positive) so a DB error never drops a
+		// deposit; consumers must still verify the address. Return the error if callers grow one.
+		logger.Error("Address lookup failed, treating as match", "type", addressType, "address", publicKey, "err", err)
+		return true
+	}
+	return true
 }
 
 func (s *publicKeyStore) ExistBatch(addressType enum.NetworkType, publicKeys []string) []bool {
-	if s.bloomFilter == nil {
-		return make([]bool, len(publicKeys))
+	out := make([]bool, len(publicKeys))
+	for i, k := range publicKeys {
+		out[i] = s.Exist(addressType, k)
 	}
-	return s.bloomFilter.ContainsBatch(publicKeys, addressType)
+	return out
 }
 
 func (s *publicKeyStore) Save(addressType enum.NetworkType, publicKey string) error {
-	if s.bloomFilter != nil {
-		s.bloomFilter.Add(publicKey, addressType)
-	}
-	return nil
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO wallet_addresses (type, address) VALUES (?, ?)`,
+		string(addressType), publicKey,
+	)
+	return err
 }
 
-func (s *publicKeyStore) Close() error {
-	return nil
-}
+func (s *publicKeyStore) Close() error { return nil }

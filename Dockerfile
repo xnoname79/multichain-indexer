@@ -22,7 +22,7 @@ ARG TARGETARCH
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags='-w -s -extldflags "-static"' \
-    -o indexer ./cmd/indexer/main.go
+    -o indexer ./cmd/indexer
 
 
 # ============================

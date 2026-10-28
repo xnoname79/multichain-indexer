@@ -1,14 +1,20 @@
 package events
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"sync"
 
+	"github.com/fystack/multichain-indexer/pkg/common/config"
+	"github.com/fystack/multichain-indexer/pkg/common/logger"
 	"github.com/fystack/multichain-indexer/pkg/common/types"
-	"github.com/fystack/multichain-indexer/pkg/infra"
 )
 
 const (
-	TransferEventTopic = "transfer:event"
+	TopicTransfer = "transfer"
+	TopicUTXO     = "utxo"
+	TopicEvent    = "event"
 )
 
 type IndexerEvent struct {
@@ -27,18 +33,49 @@ type Emitter interface {
 	Close()
 }
 
+// emitter persists events to the SQLite outbox, then wakes the webhook
+// dispatcher over a channel. An event is only removed once delivered, so a
+// crash or a down webhook never loses it.
 type emitter struct {
-	queue         infra.MessageQueue
-	utxoQueue     infra.MessageQueue
-	subjectPrefix string
+	db      *sql.DB
+	webhook config.WebhookConfig
+	wake    chan struct{}
+	cancel  context.CancelFunc
+	done    chan struct{}
+	once    sync.Once
 }
 
-func NewEmitter(queue infra.MessageQueue, utxoQueue infra.MessageQueue, subjectPrefix string) Emitter {
-	return &emitter{
-		queue:         queue,
-		utxoQueue:     utxoQueue,
-		subjectPrefix: subjectPrefix,
+func NewEmitter(db *sql.DB, webhook config.WebhookConfig) Emitter {
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &emitter{
+		db:      db,
+		webhook: webhook,
+		wake:    make(chan struct{}, 1),
+		cancel:  cancel,
+		done:    make(chan struct{}),
 	}
+	if webhook.URL == "" {
+		logger.Warn("webhook.url not set: matched events stay in the outbox table")
+		close(e.done)
+		return e
+	}
+	go e.dispatch(ctx)
+	return e
+}
+
+func (e *emitter) enqueue(topic string, key any, payload []byte) error {
+	// OR IGNORE: a re-processed block re-emits the same key while it is still pending.
+	if _, err := e.db.Exec(
+		`INSERT OR IGNORE INTO outbox (topic, key, payload) VALUES (?, ?, ?)`,
+		topic, key, payload,
+	); err != nil {
+		return err
+	}
+	select {
+	case e.wake <- struct{}{}:
+	default: // a wake-up is already pending
+	}
+	return nil
 }
 
 func (e *emitter) EmitBlock(chain string, block *types.Block) error {
@@ -51,9 +88,7 @@ func (e *emitter) EmitTransaction(chain string, tx *types.Transaction) error {
 	if err != nil {
 		return err
 	}
-	return e.queue.Enqueue(infra.TransferEventTopicQueue, txBytes, &infra.EnqueueOptions{
-		IdempotententKey: tx.Hash(),
-	})
+	return e.enqueue(TopicTransfer, tx.Hash(), txBytes)
 }
 
 func (e *emitter) EmitUTXO(chain string, utxo *types.UTXOEvent) error {
@@ -61,9 +96,7 @@ func (e *emitter) EmitUTXO(chain string, utxo *types.UTXOEvent) error {
 	if err != nil {
 		return err
 	}
-	return e.utxoQueue.Enqueue(infra.UTXOEventTopicQueue, utxoBytes, &infra.EnqueueOptions{
-		IdempotententKey: utxo.Hash(),
-	})
+	return e.enqueue(TopicUTXO, utxo.Hash(), utxoBytes)
 }
 
 func (e *emitter) EmitError(chain string, err error) error {
@@ -76,15 +109,13 @@ func (e *emitter) Emit(event IndexerEvent) error {
 	if err != nil {
 		return err
 	}
-	// All chains emit to the same subject
-	return e.queue.Enqueue(e.subjectPrefix, data, nil)
+	return e.enqueue(TopicEvent, nil, data)
 }
 
+// Close stops the dispatcher; undelivered events stay in the outbox for the next start.
 func (e *emitter) Close() {
-	if e.queue != nil {
-		e.queue.Close()
-	}
-	if e.utxoQueue != nil {
-		e.utxoQueue.Close()
-	}
+	e.once.Do(func() {
+		e.cancel()
+		<-e.done
+	})
 }

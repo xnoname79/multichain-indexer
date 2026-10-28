@@ -37,7 +37,7 @@ func NewManualWorker(
 	chain indexer.Indexer,
 	cfg config.ChainConfig,
 	kv infra.KVStore,
-	redisClient infra.RedisClient,
+	mbs missingblockstore.MissingBlocksStore,
 	blockStore blockstore.Store,
 	emitter events.Emitter,
 	pubkeyStore pubkeystore.Store,
@@ -57,7 +57,7 @@ func NewManualWorker(
 			failedChan,
 			statusRegistry,
 		),
-		mbs:    missingblockstore.NewMissingBlocksStore(redisClient),
+		mbs:    mbs,
 		config: DefaultManualConfig,
 	}
 }
@@ -153,9 +153,7 @@ func (mw *ManualWorker) handleRange(ctx context.Context, start, end uint64) {
 		"lastSuccess", lastSuccess,
 	)
 
-	if lastSuccess >= start {
-		_ = mw.mbs.SetRangeProcessed(ctx, mw.chain.GetNetworkInternalCode(), start, end, lastSuccess)
-	}
+	// A partly done range stays claimed until RangeProcessingTimeout, then is retried.
 	if lastSuccess >= end {
 		if err := mw.mbs.RemoveRange(ctx, mw.chain.GetNetworkInternalCode(), start, end); err != nil {
 			mw.logger.Error("RemoveRange failed", "err", err, "chain", mw.chain.GetName())
