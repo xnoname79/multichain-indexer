@@ -124,6 +124,9 @@ type TonConfig struct {
 	ShardScanWorkers int `yaml:"shard_scan_workers"`
 	// TxFetchWorkers controls parallel GetTransaction calls per shard block.
 	TxFetchWorkers int `yaml:"tx_fetch_workers"`
+	// JettonMasters lists jetton master contracts whose wallets are pre-derived for
+	// every watched TON owner at startup.
+	JettonMasters []string `yaml:"jetton_masters"`
 }
 
 type NodeConfig struct {

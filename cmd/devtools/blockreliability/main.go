@@ -11,7 +11,6 @@ import (
 	"syscall"
 
 	"github.com/fystack/multichain-indexer/internal/worker"
-	"github.com/fystack/multichain-indexer/pkg/addressbloomfilter"
 	"github.com/fystack/multichain-indexer/pkg/common/config"
 	"github.com/fystack/multichain-indexer/pkg/common/logger"
 	"github.com/fystack/multichain-indexer/pkg/events"
@@ -57,52 +56,21 @@ func main() {
 		logger.Fatal("Invalid chains", "err", err)
 	}
 
-	services := cfg.Services
-
-	// Redis
-	redisClient, err := infra.NewRedisClient(
-		services.Redis.URL,
-		services.Redis.Password,
-		string(cfg.Environment),
-		services.Redis.MTLS,
-	)
+	// Throwaway SQLite file: the devtool only measures block processing.
+	tmpDir, err := os.MkdirTemp("", "blockreliability-")
 	if err != nil {
-		logger.Fatal("Redis connection failed", "err", err)
+		logger.Fatal("Create temp dir failed", "err", err)
 	}
-
-	// KVStore
-	kv, err := kvstore.NewFromConfig(services.KVS)
+	defer os.RemoveAll(tmpDir)
+	db, err := infra.OpenSQLite(tmpDir + "/indexer.db")
 	if err != nil {
-		logger.Fatal("KVStore connection failed", "err", err)
+		logger.Fatal("Open SQLite failed", "err", err)
 	}
-	defer kv.Close()
+	defer db.Close()
 
-	// NATS
-	natsConn, err := infra.GetNATSConnection(services.Nats, string(cfg.Environment))
-	if err != nil {
-		logger.Fatal("NATS connection failed", "err", err)
-	}
-	defer natsConn.Close()
-
-	eventQueueManager := infra.NewNATsMessageQueueManager("transfer", []string{
-		"transfer.event.*",
-	}, natsConn)
-	eventQueue := eventQueueManager.NewMessageQueue("dispatch")
-
-	utxoQueueManager := infra.NewNATsMessageQueueManager("utxo", []string{
-		"utxo.event.*",
-	}, natsConn)
-	utxoQueue := utxoQueueManager.NewMessageQueue("dispatch")
-
-	emitter := events.NewEmitter(eventQueue, utxoQueue, services.Nats.SubjectPrefix)
+	kv := kvstore.NewSQLiteStore(db, infra.JSON)
+	emitter := events.NewEmitter(db, config.WebhookConfig{}) // never post devtool events to the real webhook
 	defer emitter.Close()
-
-	// Address bloom filter (optional)
-	var addressBF addressbloomfilter.WalletAddressBloomFilter
-	if services.Bloomfilter != nil {
-		addressBF = addressbloomfilter.NewBloomFilter(*services.Bloomfilter, nil, redisClient)
-		logger.Info("Address bloom filter created (no DB initialization)")
-	}
 
 	// Create tracker
 	tracker := NewTracker()
@@ -120,10 +88,8 @@ func main() {
 		ctx,
 		cfg,
 		kv,
-		nil, // no DB needed for devtool
-		addressBF,
+		db,
 		emitter,
-		redisClient,
 		managerCfg,
 	)
 

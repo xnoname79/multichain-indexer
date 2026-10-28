@@ -193,8 +193,13 @@ func (bw *BaseWorker) handleBlockResult(result indexer.BlockResult) bool {
 		return false
 	}
 
-	// Emit transactions if relevant
-	bw.emitBlock(result.Block)
+	// Emit transactions if relevant. An outbox write failure fails the block so it is retried.
+	if err := bw.emitBlock(result.Block); err != nil {
+		return bw.handleBlockResult(indexer.BlockResult{
+			Number: result.Number,
+			Error:  &indexer.Error{ErrorType: indexer.ErrorTypeUnknown, Message: "emit: " + err.Error()},
+		})
+	}
 
 	bw.logger.Info("Processed block successfully",
 		"chain", bw.chain.GetName(),
@@ -208,9 +213,9 @@ func (bw *BaseWorker) handleBlockResult(result indexer.BlockResult) bool {
 // emitBlock emits relevant transactions for subscribed addresses.
 // When two_way_indexing is enabled, both incoming (to) and outgoing (from) transfers are emitted.
 // For internal transfers where both addresses are monitored, two events are emitted — one per direction.
-func (bw *BaseWorker) emitBlock(block *types.Block) {
+func (bw *BaseWorker) emitBlock(block *types.Block) error {
 	if block == nil || bw.pubkeyStore == nil {
-		return
+		return nil
 	}
 
 	addressType := bw.chain.GetNetworkType()
@@ -240,7 +245,9 @@ func (bw *BaseWorker) emitBlock(block *types.Block) {
 				"status", inTx.Status,
 				"confirmations", inTx.Confirmations,
 			)
-			_ = bw.emitter.EmitTransaction(bw.chain.GetName(), &inTx)
+			if err := bw.emitter.EmitTransaction(bw.chain.GetName(), &inTx); err != nil {
+				return err
+			}
 		}
 
 		if fromMonitored {
@@ -257,11 +264,13 @@ func (bw *BaseWorker) emitBlock(block *types.Block) {
 				"status", outTx.Status,
 				"confirmations", outTx.Confirmations,
 			)
-			_ = bw.emitter.EmitTransaction(bw.chain.GetName(), &outTx)
+			if err := bw.emitter.EmitTransaction(bw.chain.GetName(), &outTx); err != nil {
+				return err
+			}
 		}
 	}
 
-	bw.emitUTXOs(block)
+	return bw.emitUTXOs(block)
 }
 
 func normalizeTransactionForDirection(
@@ -288,23 +297,23 @@ func cloneTransactionMetadata(tx types.Transaction) types.Transaction {
 }
 
 // emitUTXOs emits UTXO events for monitored addresses.
-func (bw *BaseWorker) emitUTXOs(block *types.Block) {
+func (bw *BaseWorker) emitUTXOs(block *types.Block) error {
 	if block == nil || bw.pubkeyStore == nil {
-		return
+		return nil
 	}
 
 	if !bw.config.IndexUTXO {
-		return
+		return nil
 	}
 
 	utxoEvents, ok := block.GetMetadata("utxo_events")
 	if !ok {
-		return
+		return nil
 	}
 
 	events, ok := utxoEvents.([]types.UTXOEvent)
 	if !ok {
-		return
+		return nil
 	}
 
 	addressType := bw.chain.GetNetworkType()
@@ -341,6 +350,9 @@ func (bw *BaseWorker) emitUTXOs(block *types.Block) {
 			"status", event.Status,
 			"confirmations", event.Confirmations,
 		)
-		_ = bw.emitter.EmitUTXO(bw.chain.GetName(), event)
+		if err := bw.emitter.EmitUTXO(bw.chain.GetName(), event); err != nil {
+			return err
+		}
 	}
+	return nil
 }

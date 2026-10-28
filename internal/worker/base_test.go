@@ -43,6 +43,7 @@ func (m capturePubkeyStore) Close() error                        { return nil }
 
 type captureEmitter struct {
 	txs []types.Transaction
+	err error
 }
 
 func (e *captureEmitter) EmitBlock(string, *types.Block) error    { return nil }
@@ -53,6 +54,9 @@ func (e *captureEmitter) Close()                                  {}
 func (e *captureEmitter) EmitTransaction(_ string, tx *types.Transaction) error {
 	if tx == nil {
 		return errors.New("nil tx")
+	}
+	if e.err != nil {
+		return e.err
 	}
 	e.txs = append(e.txs, *tx)
 	return nil
@@ -230,5 +234,31 @@ func TestBaseWorkerEmitBlock_AppliesNativeOutgoingOverrides(t *testing.T) {
 	}
 	if outTx.GetMetadataString(testSourceTypeKey) != "" || outTx.GetMetadataString(testSourceAmountKey) != "" || outTx.GetMetadataString(testSourceAssetKey) != "" {
 		t.Fatalf("outgoing tx should not leak directional override metadata")
+	}
+}
+
+func TestHandleBlockResult_EmitFailureMarksBlockFailed(t *testing.T) {
+	t.Parallel()
+
+	store := &stubBlockStore{}
+	bw := &BaseWorker{
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		chain:       directionalTestIndexer{},
+		blockStore:  store,
+		pubkeyStore: capturePubkeyStore{addresses: map[string]struct{}{"GDEST": {}}},
+		emitter:     &captureEmitter{err: errors.New("disk full")},
+	}
+
+	ok := bw.handleBlockResult(indexer.BlockResult{
+		Number: 42,
+		Block: &types.Block{Number: 42, Transactions: []types.Transaction{
+			{TxHash: "tx", ToAddress: "GDEST"},
+		}},
+	})
+	if ok {
+		t.Fatal("block must not count as processed when its event was not persisted")
+	}
+	if len(store.failedBlocks) != 1 || store.failedBlocks[0] != 42 {
+		t.Fatalf("expected block 42 saved for retry, got %v", store.failedBlocks)
 	}
 }

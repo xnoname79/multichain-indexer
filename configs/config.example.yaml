@@ -455,6 +455,9 @@ chains:
       shard_scan_workers: 2
       # Parallel GetTransaction workers inside each shard block.
       tx_fetch_workers: 6
+      # Jetton masters whose wallets are derived for every watched TON address at startup.
+      jetton_masters:
+        - "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs" # USDT
 
   ton_testnet:
     network_id: "ton_testnet"
@@ -490,48 +493,16 @@ services:
     mempool:
       enabled: true # Bitcoin-only: 0-conf transaction tracking for instant UX
 
-  nats:
-    url: "nats://localhost:4222"
-    subject_prefix: "indexer" # optional subject prefix
-    username: "" # optional username
-    password: "" # optional password
-    # TLS configuration (optional, defaults to ./certs/ if not specified)
-    tls:
-      client_cert: "./certs/client-cert.pem" # defaults to ./certs/client-cert.pem
-      client_key: "./certs/client-key.pem" # defaults to ./certs/client-key.pem
-      ca_cert: "./certs/rootCA.pem" # defaults to ./certs/rootCA.pem
+  # Everything (progress, watched addresses, manual ranges, undelivered events)
+  # lives in this one SQLite file. No external services are needed.
+  db_path: "data/indexer.db"
 
-  database:
-    url: "postgres://postgres:postgres@localhost:5432/postgres"
+  # Matched transfers are POSTed here as JSON, in order, retried until a 2xx.
+  # Headers: X-Event-Type (transfer|utxo), Idempotency-Key (dedupe on it),
+  # X-Signature-256 (sha256=<hex HMAC of the body>) when secret is set.
+  webhook:
+    url: "http://localhost:3000/indexer/events"
+    secret: ""
 
-  redis:
-    url: "localhost:6379" # supports redis://host:port or rediss://host:port (TLS)
-    password: ""
-    mtls: false # enable mutual TLS with client certificates (production only)
-
-  kvstore:
-    type: "consul"
-    consul:
-      scheme: "http"
-      address: "127.0.0.1:8500"
-      folder: "indexer"
-      token: ""
-      # http_auth:                   # optional: enable if consul is secured
-      #   username: ""
-      #   password: ""
-
-  bloomfilter:
-    type: "redis" # redis or in_memory
-    wallet_address_repo: "wallet_address"
-    batch_size: 1000
-    redis:
-      key_prefix: "wallet_bloom"
-      error_rate: 0.01 # expected false positive rate
-      capacity: 1000000 # max number of addresses
-    in_memory: # alternative config (if not using redis)
-      expected_items: 1000000
-      false_positive_rate: 0.01
-    sync:
-      enabled: false
-      interval: "1s" # how often to check for new addresses
-      batch_size: 500 # max addresses to fetch per sync cycle
+  # Bearer token for POST /addresses and POST /manual-ranges. Empty disables both.
+  api_token: ""

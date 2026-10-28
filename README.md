@@ -4,7 +4,7 @@
 
 **Detect deposits to your addresses across 12+ blockchains in real time.**
 
-A production-ready indexer that parses every on-chain transaction, matches destination addresses against your system via bloom filters, and streams matched transfers to NATS JetStream.
+A production-ready indexer that parses every on-chain transaction, matches destination addresses against your watched list, and POSTs matched transfers to your webhook. One Go binary with an embedded SQLite file — no NATS, Postgres, Redis or Consul to run.
 
 ![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -24,11 +24,11 @@ A production-ready indexer that parses every on-chain transaction, matches desti
 
 - **14+ Chains** — Ethereum, BSC, TRON, Polygon, Arbitrum, Optimism, Bitcoin, Solana, Aptos, Sui, Cosmos, TON, XRP, Stellar
 - **Real-time + Historical** — Four cooperating workers cover live blocks, gap backfill, failed retries, and manual rescans
-- **Bloom Filter Matching** — Sub-millisecond address lookups against millions of addresses with near-zero memory overhead
-- **NATS JetStream Events** — Matched transactions streamed instantly for downstream processing
+- **Exact Address Matching** — Indexed SQLite lookups: no false positives, new addresses count immediately, addresses stay on disk instead of RAM
+- **Webhook Events** — Matched transactions are written to an outbox, then POSTed in order with retry until your app acknowledges them
 - **RPC Failover** — Automatic failover across multiple providers with rate limiting and exponential backoff
-- **Restart-Safe** — All progress persisted to KV store; pick up exactly where you left off
-- **Single Binary** — One Go binary indexes all chains concurrently, no external orchestration needed
+- **Restart-Safe** — Progress and undelivered events persisted to SQLite; pick up exactly where you left off
+- **Single Binary** — One static Go binary (no CGO) indexes all chains concurrently; no external services needed
 
 ## Architecture
 
@@ -37,10 +37,10 @@ A production-ready indexer that parses every on-chain transaction, matches desti
 ```mermaid
 flowchart LR
     RPC[Blockchain RPCs] --> W[Workers]
-    W --> BF{Bloom Filter}
-    BF -->|match| NATS[NATS JetStream]
-    BF -->|no match| DROP[Discard]
-    NATS --> APP[Your Application]
+    W --> DB{Watched address?<br/>SQLite lookup}
+    DB -->|match| OUT[(SQLite outbox)]
+    DB -->|no match| DROP[Discard]
+    OUT -->|webhook POST| APP[Your Application]
 ```
 
 <details>
@@ -60,12 +60,13 @@ flowchart TB
 
     subgraph Storage ["Storage & Messaging"]
         direction LR
-        KV[(KV Store)]
-        NATS[(NATS Events)]
+        KV[(SQLite kv)]
+        OUT[(SQLite outbox)]
         FChan[(failedChan)]
     end
 
-    Redis[(Redis ZSET)]
+    MR[(SQLite missing_ranges)]
+    HOOK[Webhook dispatcher]
 
     R --> BW
     C --> BW
@@ -73,11 +74,12 @@ flowchart TB
     Re --> BW
 
     BW --> KV
-    BW --> NATS
+    BW --> OUT
     BW --> FChan
 
+    OUT -.->|chan wake-up| HOOK
     FChan -.-> Re
-    M -.-> Redis
+    M -.-> MR
 ```
 
 </details>
@@ -86,9 +88,9 @@ flowchart TB
 
 | Metric | Value |
 | --- | --- |
-| Address lookup (bloom filter) | < 1ms per check |
+| Address lookup (SQLite primary key) | microseconds per check, exact |
 | Concurrent chains | Limited only by RPC capacity |
-| Memory footprint | ~50 MB base + bloom filter |
+| Memory footprint | ~25 MB RSS measured with one chain; addresses live on disk |
 | Recovery time | Instant — resumes from last persisted block |
 
 ## Why This Indexer?
@@ -97,7 +99,7 @@ flowchart TB
 | --- | --- | --- | --- | --- |
 | Self-hosted | Yes | Requires subgraph infra | No (SaaS) | Yes |
 | Multi-chain in one binary | 12+ chains | Per-subgraph | Per-webhook | Manual per chain |
-| Address filtering | Bloom filter (millions of addrs) | GraphQL queries | Webhook filters | Custom logic |
+| Address filtering | Exact SQLite lookup (millions of addrs) | GraphQL queries | Webhook filters | Custom logic |
 | Historical backfill | Built-in (catchup + manual workers) | Re-index subgraph | Limited | Manual |
 | Latency | Block time (~1-12s) | Minutes (indexing delay) | Seconds | Block time |
 | Cost | Infra only | Hosted fees or infra | Per-event pricing | Infra only |
@@ -128,8 +130,8 @@ flowchart TB
 
 - [Quick Start](#-quick-start)
 - [Worker Logic](#%EF%B8%8F-worker-logic)
-- [KVStore / Redis Keys](#%EF%B8%8F-kvstore--redis-keys)
-- [Prerequisites](#-prerequisites)
+- [Storage](#%EF%B8%8F-storage)
+- [Admin API](#-admin-api)
 - [Configuration](#-configuration)
 - [Usage Highlights](#-usage-highlights)
 - [Consuming Transaction Events](#-consuming-transaction-events)
@@ -142,7 +144,7 @@ flowchart TB
 
 1. **RegularWorker**: real-time indexing, reorg handling, error reporting
 2. **CatchupWorker**: backfills gaps, tracks progress, cleans up ranges
-3. **ManualWorker**: consumes Redis ranges, concurrent-safe backfill
+3. **ManualWorker**: backfills ranges queued via `POST /manual-ranges`
 4. **RescannerWorker**: retries failed blocks, updates KV on success
 
 ---
@@ -154,7 +156,7 @@ git clone https://github.com/fystack/multichain-indexer.git
 cd transaction-indexer
 go mod download
 cp configs/config.example.yaml configs/config.yaml
-go build -o indexer cmd/indexer/main.go
+CGO_ENABLED=0 go build -o indexer ./cmd/indexer
 
 # Index EVM & TRON in real-time
 ./indexer index --chains=ethereum_mainnet,tron_mainnet
@@ -164,6 +166,10 @@ go build -o indexer cmd/indexer/main.go
 
 # Add manual worker for missing blocks
 ./indexer index --chains=ethereum_mainnet,tron_mainnet --manual
+
+# Watch an address (needs services.api_token in config.yaml)
+curl -X POST localhost:8080/addresses -H "Authorization: Bearer $TOKEN" \
+  -d '{"type":"evm","addresses":["0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"]}'
 
 # For help
 ./indexer --help
@@ -176,7 +182,7 @@ go build -o indexer cmd/indexer/main.go
 ### **BaseWorker**
 
 - Shared logic for all worker types
-- Rate limiting, logging, bloom filter, KV store integration, infrastructure management
+- Rate limiting, logging, address matching, KV store integration
 - Sends error blocks to `failedChan` and stores in `<chain>/failed_blocks/<block>`
 
 ---
@@ -202,20 +208,14 @@ go build -o indexer cmd/indexer/main.go
 ### **ManualWorker**
 
 - Handles **explicit missing blocks** (due to RPC errors, reorg skips, or manual intervention).
-- Missing ranges are stored in **Redis ZSET**:
-
-  - Member format: `"start-end"`
-  - Score = `start` (to sort ranges by block number)
-  - Large ranges split into small ranges (default 5 blocks) for finer retries
-
-- **Concurrency-safe with Redis locks** (`SETNX + EX` via Lua)
+- Ranges are queued with `POST /manual-ranges` and stored in the SQLite `missing_ranges` table
+  - Overlapping or adjacent ranges are merged, then split into 5-block chunks for finer retries
 - Workflow:
 
-  1. Claim unprocessed range (`GetNextRange`)
+  1. Claim the lowest unclaimed range (`GetNextRange`); the claim lasts `RangeProcessingTimeout`
   2. Process all blocks in `[start,end]`
-  3. Update progress with `SetRangeProcessed`
-  4. On full success → `RemoveRange`
-  5. On partial timeout → reinsert remaining `[current,end]`
+  3. On full success → `RemoveRange`
+  4. On partial failure → the claim expires and the range is retried
 
 ---
 
@@ -228,41 +228,48 @@ go build -o indexer cmd/indexer/main.go
 
 ---
 
-## 🗝️ KVStore / Redis Keys
+## 🗝️ Storage
 
-| Key                                      | Purpose                             |
-| ---------------------------------------- | ----------------------------------- |
-| `<chain>/latest_block`                   | RegularWorker progress              |
-| `<chain>/catchup_progress/<start>-<end>` | CatchupWorker progress per range    |
-| `<chain>/failed_blocks/<block>`          | Failed blocks metadata for retry    |
-| `<chain_type>/<address>`                 | Public key store                    |
-| `missing_blocks:<chain>`                 | Redis ZSET of missing ranges        |
-| `processing:<chain>:<start>-<end>`       | Redis lock key for concurrent claim |
-| `processed:<chain>:<start>-<end>`        | Last processed block in range       |
+All state lives in one SQLite file (`services.db_path`, default `data/indexer.db`):
+
+| Table / key | Purpose |
+| --- | --- |
+| `kv` → `block_states/<chain>/latest_block` | RegularWorker progress |
+| `kv` → `block_states/<chain>/catchup_progress/<start>-<end>` | CatchupWorker progress per range |
+| `kv` → `block_states/<chain>/failed_blocks` | Failed blocks for retry |
+| `wallet_addresses` | Watched addresses, keyed by `(type, address)` |
+| `missing_ranges` | ManualWorker queue |
+| `outbox` | Matched events not yet acknowledged by the webhook |
+
+Back it up by copying the file while the indexer is stopped, or with `sqlite3 indexer.db ".backup copy.db"` while running.
 
 ---
 
-## ✅ Prerequisites
+## 🔌 Admin API
 
-Start required services before running the indexer (docker-compose provided):
-
-- NATS server (events)
-- Consul (KV) or Badger (embedded)
-- PostgreSQL (wallet address repo)
-- Redis (for Bloom filter or ManualWorker)
+Served on `services.port` next to `/health` and `/status`. Both endpoints need `Authorization: Bearer <services.api_token>`; with no token configured they are disabled.
 
 ```bash
-docker-compose up -d
+# Watch addresses (type: evm, tron, btc, sol, apt, sui, cosmos, ton, xrp, stellar). Up to 10,000 per call.
+# Matching is exact and case-sensitive: send addresses in the form the chain reports them.
+curl -X POST localhost:8080/addresses -H "Authorization: Bearer $TOKEN" \
+  -d '{"type":"tron","addresses":["TAWdqnuYCNU3dKsi7pR8d7sDkx1Evb2giV"]}'
+
+# Queue a block range for the manual worker (run with --manual). Up to 100,000 blocks per call.
+curl -X POST localhost:8080/manual-ranges -H "Authorization: Bearer $TOKEN" \
+  -d '{"chain":"ethereum_mainnet","start":21500000,"end":21500100}'
 ```
+
+Both return `204` on success and `400` with a reason on bad input.
 
 ---
 
 ## 🔧 Configuration
 
 - **Chains**: configurable (`start_block`, `batch_size`, `poll_interval`)
-- **KVStore**: BadgerDB / in-memory / Consul
-- **Bloom Filter**: Redis or in-memory
-- **Event Emitter**: NATS streaming
+- **Storage**: one SQLite file (`services.db_path`)
+- **Events**: webhook (`services.webhook.url`, optional `secret` for HMAC signing)
+- **Admin API**: `services.api_token`
 - **RPC Providers**: failover + rate-limiting
 
 See `configs/config.example.yaml` for details.
@@ -274,8 +281,8 @@ See `configs/config.example.yaml` for details.
 - **Multi-chain support**: independent workers per chain
 - **Auto-catchup**: detect gaps → backfill → cleanup
 - **Failed block recovery**: persisted + retryable
-- **Manual backfill**: Redis-driven, safe for concurrency
-- **State persistence**: KV + BlockStore → restart-safe
+- **Manual backfill**: ranges queued over the admin API
+- **State persistence**: SQLite (progress + outbox) → restart-safe, events survive crashes
 
 ---
 
@@ -291,22 +298,12 @@ Example: `ethereum_mainnet`, `tron_mainnet`.
 # Real-time + catchup (fill historical gaps)
 ./indexer index --chains=ethereum_mainnet,tron_mainnet --catchup
 
-# Add manual worker to process missing blocks from Redis
+# Add manual worker to process ranges queued via POST /manual-ranges
 ./indexer index --chains=ethereum_mainnet,tron_mainnet --manual
 
 # Debug mode (extra logs)
 ./indexer index --chains=ethereum_mainnet,tron_mainnet --debug
 
-# NATS JetStream transaction monitoring (using NATS CLI)
-nats stream add transfer --subjects="transfer.event.*" --storage=file --retention=workqueue
-nats consumer add transfer transaction-consumer --filter="transfer.event.dispatch" --deliver=all --ack=explicit
-nats consumer sub transfer transaction-consumer
-
-# Initialize bloom filter and kvstore
-./wallet-kv-load run --config configs/config.yaml --batch 10000 --debug
-
-# Migrate from Badger to Consul (edit migrate.yaml first)
-./kv-migrate run --config configs/config.yaml --dry-run
 ```
 
 ---
@@ -372,34 +369,19 @@ chains:
 
 ## 📡 Consuming Transaction Events
 
-The indexer publishes transaction events to NATS JetStream. Here's how to consume them:
+Matched events are POSTed to `services.webhook.url`, one event per request, as JSON:
 
-### NATS JetStream Configuration
+| Header | Value |
+| --- | --- |
+| `X-Event-Type` | `transfer` or `utxo` |
+| `Idempotency-Key` | Stable event ID. Delivery is at-least-once, so dedupe on it |
+| `X-Signature-256` | `sha256=<hex HMAC-SHA256 of the body>`, when `webhook.secret` is set |
 
-- **Stream Name**: `transfer`
-- **Subjects**: `transfer.event.*`
-- **Transaction Topic**: `transfer.event.dispatch`
-- **Storage**: FileStorage with WorkQueue retention policy
-
-### Using NATS CLI
-
-```bash
-# Create stream (if not exists)
-nats stream add transfer --subjects="transfer.event.*" --storage=file --retention=workqueue
-
-# Create consumer
-nats consumer add transfer my-consumer --filter="transfer.event.dispatch" --deliver=all --ack=explicit
-
-# Consume transactions
-nats consumer sub transfer my-consumer
-
-# Get stream info
-nats stream info transfer
-```
+Delivery is in order. A non-`2xx` response or timeout (10s) is retried with backoff (1s → 1m) until it succeeds, and later events wait behind it, so a broken endpoint stalls delivery rather than dropping deposits. Undelivered events stay in the `outbox` table across restarts.
 
 ### Sample Transfer Events
 
-Each message published to NATS contains a single transaction serialized as JSON.
+Each webhook request body is a single transaction serialized as JSON.
 
 **EVM Native Transfer (ETH):**
 
@@ -518,45 +500,41 @@ Each message published to NATS contains a single transaction serialized as JSON.
 | `txFee` | Transaction fee in native token |
 | `timestamp` | Unix timestamp |
 
-### Important: Bloom Filter and Event Verification
+### Important: Event Verification
 
-> **Warning:** The bloom filter used for address filtering is a **probabilistic data structure**. It guarantees that if an address is *not* in the filter, it will never match (no false negatives), but it *may* occasionally produce **false positives** — meaning you could receive events for addresses that are not actually in your system.
->
-> When consuming transaction events, **always verify that the destination address (`toAddress`) exists in your system before crediting your ledger.** Do not blindly trust bloom filter matches for financial operations.
+> Address matching is exact, but if the address lookup itself fails (for example a disk error), the indexer treats the transaction as a match rather than risk missing a deposit. **Always verify that `toAddress` exists in your system and check `X-Signature-256` before crediting your ledger.**
 
-### Using Go JetStream Client
+### Go Webhook Receiver
 
 ```go
 package main
 
 import (
-    "context"
+    "crypto/hmac"
+    "crypto/sha256"
+    "encoding/hex"
+    "io"
     "log"
-    "github.com/nats-io/nats.go"
-    "github.com/nats-io/nats.go/jetstream"
+    "net/http"
 )
 
+const secret = "change-me" // services.webhook.secret
+
 func main() {
-    nc, _ := nats.Connect("nats://localhost:4222")
-    defer nc.Close()
-
-    js, _ := jetstream.New(nc)
-
-    // Create or get consumer filtered to transfer.event.dispatch
-    consumer, _ := js.CreateOrUpdateConsumer(context.Background(), "transfer", jetstream.ConsumerConfig{
-        Name:           "my-consumer",
-        Durable:        "my-consumer",
-        FilterSubjects: []string{"transfer.event.dispatch"},
-        MaxDeliver:     3,
+    http.HandleFunc("/indexer/events", func(w http.ResponseWriter, r *http.Request) {
+        body, _ := io.ReadAll(r.Body)
+        mac := hmac.New(sha256.New, []byte(secret))
+        mac.Write(body)
+        want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+        if !hmac.Equal([]byte(want), []byte(r.Header.Get("X-Signature-256"))) {
+            http.Error(w, "bad signature", http.StatusUnauthorized)
+            return
+        }
+        // Dedupe on Idempotency-Key, then process. Return 2xx only once it is stored.
+        log.Printf("%s %s: %s", r.Header.Get("X-Event-Type"), r.Header.Get("Idempotency-Key"), body)
+        w.WriteHeader(http.StatusNoContent)
     })
-
-    // Consume messages
-    consumer.Consume(func(msg jetstream.Msg) {
-        log.Printf("Transaction: %s", string(msg.Data()))
-        msg.Ack()
-    })
-
-    select {} // Keep running
+    log.Fatal(http.ListenAndServe(":3000", nil))
 }
 ```
 
