@@ -81,10 +81,8 @@ func (rw *RegularWorker) Start() {
 
 // Stop stops the worker and cleans up resources
 func (rw *RegularWorker) Stop() {
-	// Save current block state before stopping
-	if rw.currentBlock > 0 {
-		_ = rw.blockStore.SaveLatestBlock(rw.chain.GetNetworkInternalCode(), rw.currentBlock)
-	}
+	// No checkpoint here: commitProgress already saved the last indexed block, and
+	// currentBlock is the next block to index, so saving it would skip that block on restart.
 	// Flush block hashes to KV before shutdown
 	rw.flushBlockHashes()
 	if rw.persistTicker != nil {

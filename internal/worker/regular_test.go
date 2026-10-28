@@ -80,6 +80,17 @@ func TestRegularWorkerProcessRegularBlocksRecoversGapViaGetBlock(t *testing.T) {
 	require.Equal(t, []uint64{101, 102}, chain.getBlockCalls)
 }
 
+func TestRegularWorkerStopDoesNotCheckpointUnindexedBlock(t *testing.T) {
+	t.Parallel()
+
+	store := &stubBlockStore{}
+	rw := newTestRegularWorker(&stubIndexer{name: "eth", internalCode: "ETH"}, store, 103, 3)
+
+	rw.Stop()
+	// Block 103 was never indexed; checkpointing it would make a restart skip it.
+	require.NotContains(t, store.savedLatest, uint64(103))
+}
+
 func TestRegularWorkerProcessRegularBlocksStopsAtConfirmedHead(t *testing.T) {
 	t.Parallel()
 
